@@ -607,7 +607,7 @@ func save(pc, sp, bp uintptr) {
 
 ##### schedlink
 
-在GMP模型中，存在如P的本地队列、全局队列等结构，`schedlink`就是G能被串联成链表的基础，作为 G 的成员字段无需为链表节点单独分配内存。关联结构包括`gQueue`和`gList`等，同一时刻一个G只能存在于`gQueue`或者`gList`之一中。其中`gQueue`是带头尾指针的双端队列，用于全局可运行队列（`schedt.runq`）及批量操作等场景；P的本地队列是定长环形数组`[256]guintptr`配合`runqhead`/`runqtail`实现的无锁结构。`gList`是单向链表，用于空闲G缓存（`gFree`）等通用场景。
+在GMP模型中存在队列结构，`schedlink`就是G能被串联成链表的基础，作为 G 的成员字段无需为链表节点单独分配内存。关联结构包括`gQueue`和`gList`等，同一时刻一个G只能存在于`gQueue`或者`gList`之一中，其中`gQueue`是带头尾指针的双端队列，用于全局可运行队列（`schedt.runq`）及批量操作等场景，而`gList`是单向链表，用于空闲G缓存（`gFree`）等通用场景。
 
 ```Go
 // A G can only be on one gQueue or gList at a time.
