@@ -544,6 +544,37 @@ func suspendG(gp *g) suspendGState {
 
 这部分属于逻辑的复用但是目标不同，被动抢占是为了公平调度，而GC时触发的抢占是为了能够进行栈扫描。
 
+```Go
+// State Machine of G States
+//
+//                                                                                                +-----------+        suspendG()        +-------------+
+//                                                                                                | _Gwaiting | <------------------------| _Gpreempted |
+//                                                                                                +-----------+                          +-------------+
+//                                                                                                      |                                       ^
+//                                                                                                      | goready()/ready()                     | asyncPreempt2()+preemptPark()
+//                                                                                                      v                                       |
+// +----------+         newproc1()         +----------+           newproc1()/goready()           +--------------+  schedule()+execute()  +-------------+  entersyscall()  +-----------+
+// |  _Gidle  | -------------------------> |  _Gdead  | ---------------------------------------> |  _Grunnable  | ---------------------> |  _Grunning  | ---------------> | _Gsyscall |
+// +----------+                            +----------+                                          +--------------+                        +-------------+                  +-----------+
+//      ^                                                                                               ^   ^                                  ^   ^                           |
+//      |                                        goexit0()                                              |   |                                  |   |      exitsyscall()        |
+//      +-----------------------------------------------------------------------------------------------+   |                                  |   +---------------------------+
+//                                                                                                          |                                  |
+//                                                                                                          |           goschedImpl()          | gopark()
+//                                                                                                          +----------------------------------+
+//
+//
+```
+
+**具体场景（完整状态转换）**
+
+- 场景1：`_Gidle -> _Gdead -> _Grunnable -> _Grunning`
+- 场景2：`_Grunning -> _Gsyscall -> _Grunning`
+- 场景3：`_Grunning -> _Gwaiting -> _Grunnable -> _Grunning`
+- 场景4：`_Grunning -> _Grunnable -> _Grunning`（普通抢占/主动让出）
+- 场景5：`_Grunning -> _Gpreempted -> _Gwaiting -> _Grunnable -> _Grunning`（GC 强制挂起）
+- 场景6：`_Grunning -> _Gdead -> _Grunnable -> _Grunning`（退出后复用）
+
 ##### m
 
 在G和M是在runtime中是双向关联的的，M结构体中存了G的指针，G的结构体也存了对应M的指针。
