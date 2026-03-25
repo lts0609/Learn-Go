@@ -356,7 +356,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 `entersyscall()`把`_Grunning`状态转换为`_Gsyscall`。`exitsyscall()`退出系统调用时，无论是否有P，都先乐观地 CAS `_Gsyscall -> _Grunning`，随后根据P的持有情况走不同路径：
 
 - **快路径**（P未被抢占）：M仍持有P，直接以`_Grunning`继续执行，无需重新调度；
-- **慢路径**（P已被sysmon抢走）：M无P，调用`exitsyscallNoP()`兜底，将`_Grunning -> _Grunnable`并入全局队列，经正常调度流程重新执行；若此时有空闲P，也可直接获取P后调用`execute()`立即执行。
+- **慢路径**（P已被sysmon抢走）：M无P，调用`exitsyscallNoP()`兜底，先将`_Grunning -> _Grunnable`；随后若能拿到空闲P可直接`execute()`继续运行，否则才进入全局队列并经正常调度流程重新执行。
 
 
 
@@ -374,7 +374,7 @@ sysmon检测到G运行超时后，调用`preemptone()`设置`preempt=true`和`st
 
 **场景6**：`_Grunning` -> `_Gpreempted` -> `_Gwaiting` -> `_Grunnable` -> `_Grunning`（GC强制挂起）
 
-GC的STW阶段调用`suspendG()`对运行中的G发出强制挂起，在`_Grunning`分支中设置`preemptStop=true`并发送SIGURG，G收到信号后执行`asyncPreempt2()`，因`preemptStop=true`调用`preemptPark()`进入`_Gpreempted`状态。`suspendG()`随后CAS将`_Gpreempted`置为`_Gwaiting`完成栈扫描，GC扫描完成后由`goready()`把`_Gwaiting`转换为`_Grunnable`，然后继续走调度流程。
+GC的STW阶段调用`suspendG()`对运行中的G发出强制挂起，在`_Grunning`分支中设置`preemptStop=true`并发送SIGURG，G收到信号后执行`asyncPreempt2()`，因`preemptStop=true`调用`preemptPark()`进入`_Gpreempted`状态。`suspendG()`随后CAS将`_Gpreempted`置为`_Gwaiting`完成栈扫描，恢复阶段由`resumeG()/ready()`将`_Gwaiting`转回`_Grunnable`，然后继续走调度流程。
 
 
 
@@ -538,43 +538,50 @@ func suspendG(gp *g) suspendGState {
 1. 直接叠加`_Gscan`的状态：_Grunnable, _Gsyscall, _Gwaiting
 2. 先转换为中间态再叠加：_Gpreempted -> _Gwaiting
 3. 不进行叠加态转换：_Gdead, _Gcopystack
-4. `_Grunning`分支：_Grunning -> _Gscanrunning -> _Gpreempted -> _Gwaiting
+4. `_Grunning`分支：_Grunning -> _Gscanrunning -> _Grunning -> _Gpreempted -> _Gwaiting
 
-这里面有一个比较特殊的分支即`_Grunning`，从上面的源码中可以看到，这个case中会先把`_Grunning`转换成`_Gscanrunning`临时锁定，然后对`g.stackguard0`设置抢占标记，再恢复到`_Grunning`状态。后续就和`sysmon`触发的被动抢占一样，G运行到安全点后栈检查时设置为`_Gpreempted`。
+这里面有一个比较特殊的分支即`_Grunning`，从上面的源码中可以看到，这个case中会先把`_Grunning`转换成`_Gscanrunning`临时锁定，然后对`g.stackguard0`设置抢占标记，再恢复到`_Grunning`状态。后续在异步抢占真正生效后，经过`preemptPark()`会把状态推进到`_Gpreempted`，再由`suspendG()`接管到`_Gwaiting`。
 
 这部分属于逻辑的复用但是目标不同，被动抢占是为了公平调度，而GC时触发的抢占是为了能够进行栈扫描。
 
 ```Go
 // State Machine of G States
 //
-//                                                                                                +-----------+        suspendG()        +-------------+
-//                                                                                                | _Gwaiting | <------------------------| _Gpreempted |
-//                                                                                                +-----------+                          +-------------+
-//                                                                                                      |                                       ^
-//                                                                                                      | goready()/ready()                     | asyncPreempt2()+preemptPark()
-//                                                                                                      v                                       |
-// +----------+         newproc1()         +----------+               newproc1()                 +--------------+  schedule()+execute()  +-------------+  entersyscall()  +-----------+
-// |  _Gidle  | -------------------------> |  _Gdead  | ---------------------------------------> |  _Grunnable  | ---------------------> |  _Grunning  | ---------------> | _Gsyscall |
-// +----------+                            +----------+                                          +--------------+                        +-------------+                  +-----------+
-//                                               ^                                                       ^                                    ^  |  ^                           |
-//                                               |                                                       |                                    |  |  |      exitsyscall()        |
-//                                               |                                                       |                                    |  |  +---------------------------+
-//                                               |                                                       |                                    |  |
-//                                               |                                                       |            goschedImpl()           |  |
-//                                               |                                                       +------------------------------------+  |
-//                                               |                                          goexit0()                                            |
-//                                               +-----------------------------------------------------------------------------------------------+ 
+//                                                                      +-----------+        suspendG()      +-------------+
+//                                                                      | _Gwaiting | <----------------------| _Gpreempted |
+//                                                                      +-----------+                        +-------------+
+//                                                                          |  ^                                   ^
+//                                                                          |  |            gopark()               | preemptPark()
+//                                                                          |  +-----------------------------------+
+//                                                                          |                                      |
+//                                                                          | goready()/ready()                    |
+//                                                                          |                                      |
+//                                                                          v                                      |
+// +----------+     newproc1()     +----------+     newproc1()      +--------------+  schedule()+execute()  +-------------+     entersyscall()   +-----------+
+// |  _Gidle  | -----------------> |  _Gdead  | ------------------> |  _Grunnable  | ---------------------> |  _Grunning  | -------------------> | _Gsyscall |
+// +----------+                    +----------+                     +--------------+                        +-------------+                      +-----------+
+//                                       ^                                 ^                                   ^  |  ^                                 |
+//                                       |                                 |                                   |  |  |          exitsyscall()          |
+//                                       |                                 |                                   |  |  +---------------------------------+
+//                                       |                                 |          exitsyscallNoP()         |  |
+//                                       |                                 +-----------------------------------+  |
+//                                       |                                 |                                   |  |
+//                                       |                                 |            goschedImpl()          |  |
+//                                       |                                 +-----------------------------------+  |
+//                                       |                              goexit0()                                 |
+//                                       +------------------------------------------------------------------------+
 //
+// - 新建协程：_Gidle -> _Gdead -> _Grunnable -> _Grunning
+// - 系统调用(快路径)：_Grunning -> _Gsyscall -> _Grunning
+// - 系统调用(慢路径)：_Grunning -> _Gsyscall -> _Grunning -> _Grunnable -> _Grunning
+// - 主动阻塞与唤醒：_Grunning -> _Gwaiting -> _Grunnable -> _Grunning
+// - 普通抢占/主动让出：_Grunning -> _Grunnable -> _Grunning
+// - GC强制挂起：_Grunning -> _Gpreempted -> _Gwaiting -> _Grunnable -> _Grunning
+// - 退出后复用：_Grunning -> _Gdead -> _Grunnable -> _Grunning
+// 
 ```
 
-**具体场景（完整状态转换）**
 
-- 场景1：`_Gidle -> _Gdead -> _Grunnable -> _Grunning`
-- 场景2：`_Grunning -> _Gsyscall -> _Grunning`
-- 场景3：`_Grunning -> _Gwaiting -> _Grunnable -> _Grunning`
-- 场景4：`_Grunning -> _Grunnable -> _Grunning`（普通抢占/主动让出）
-- 场景5：`_Grunning -> _Gpreempted -> _Gwaiting -> _Grunnable -> _Grunning`（GC 强制挂起）
-- 场景6：`_Grunning -> _Gdead -> _Grunnable -> _Grunning`（退出后复用）
 
 ##### m
 
