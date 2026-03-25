@@ -420,7 +420,7 @@ func suspendG(gp *g) suspendGState {
 			dumpgstatus(gp)
 			throw("invalid g status")
 
-		case _Gdead:
+		case _Gdead, _Gdeadextra:
 			// Nothing to suspend.
 			//
 			// preemptStop may need to be cleared, but
@@ -446,7 +446,7 @@ func suspendG(gp *g) suspendGState {
 			s = _Gwaiting
 			fallthrough
 
-		case _Grunnable, _Gsyscall, _Gwaiting:
+		case _Grunnable, _Gsyscall, _Gwaiting, _Gleaked:
 			// Claim goroutine by setting scan bit.
 			// This may race with execution or readying of gp.
 			// The scan bit keeps it from transition state.
